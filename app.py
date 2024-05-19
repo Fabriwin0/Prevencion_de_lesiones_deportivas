@@ -1,71 +1,70 @@
-# app.py
 from flask import Flask, render_template, request, jsonify
 import numpy as np
 import cv2
 import base64
 import torch
-from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2, FasterRCNN_ResNet50_FPN_V2_Weights
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision import transforms
 
 app = Flask(__name__)
 
 # Cargar el modelo preentrenado
-model = fasterrcnn_resnet50_fpn_v2(weights=FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT)
-model.eval()
+def cargar_modelo():
+    model = fasterrcnn_resnet50_fpn(pretrained=True)
+    
+    # Reemplazar el clasificador de la cabeza con un nuevo clasificador para las clases de lesiones deportivas
+    num_classes = 81  # COCO dataset tiene 80 clases más una clase de fondo
+    num_lesiones_deportivas = 5  # Por ejemplo, supongamos que hay 5 clases de lesiones deportivas
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_lesiones_deportivas)
 
-# Clase de COCO dataset
-classes = [
-    'background', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
-    'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'street sign',
-    'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse',
-    'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'hat', 'backpack',
-    'umbrella', 'shoe', 'eye glasses', 'handbag', 'tie', 'suitcase', 'frisbee',
-    'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove',
-    'skateboard', 'surfboard', 'tennis racket', 'bottle', 'plate', 'wine glass',
-    'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich',
-    'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
-    'couch', 'potted plant', 'bed', 'mirror', 'dining table', 'window', 'desk',
-    'toilet', 'door', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
-    'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'blender', 'book',
-    'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush', 'hair brush'
-]
+    return model
 
-# Función para dibujar bounding boxes
-def draw_bboxes(image: np.array, det_objects: dict):
-    """Draw bounding boxes and predicted classes"""
-    colors = np.random.uniform(0, 255, size=(len(classes), 3))
-
-    for box, box_class, score in zip(det_objects[0]['boxes'].detach().numpy().astype(int),
-                                     det_objects[0]['labels'].detach().numpy(),
-                                     det_objects[0]['scores'].detach().numpy()):
-        if score > 0.5:
-            box = [(box[0], box[1]), (box[2], box[3])]
-            cv2.rectangle(img=image, pt1=box[0], pt2=box[1], color=colors[box_class], thickness=4)
-            cv2.putText(img=image, text=classes[box_class], org=box[0], fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                        fontScale=2, color=colors[box_class], thickness=4)
+# Función para procesar la imagen y ejecutar la detección de objetos
+def detectar_lesiones_deportivas(imagen_base64, modelo):
+    # Decodificar la imagen desde base64
+    imagen_bytes = base64.b64decode(imagen_base64)
+    imagen_np = np.frombuffer(imagen_bytes, dtype=np.uint8)
+    imagen_cv2 = cv2.imdecode(imagen_np, cv2.IMREAD_COLOR)
+    
+    # Preprocesamiento de la imagen
+    transformacion = transforms.Compose([transforms.ToTensor()])
+    imagen_tensor = transformacion(imagen_cv2)
+    
+    # Ejecutar la detección de objetos
+    modelo.eval()
+    with torch.no_grad():
+        resultados = modelo([imagen_tensor])
+    
+    # Filtrar detecciones de lesiones deportivas
+    detecciones_lesiones_deportivas = []
+    for i, deteccion in enumerate(resultados[0]['labels']):
+        if deteccion.item() > 0:  # Ignorar la clase de fondo
+            detecciones_lesiones_deportivas.append({
+                'clase': deteccion.item(),
+                'score': resultados[0]['scores'][i].item(),
+                'bbox': resultados[0]['boxes'][i].tolist()
+            })
+    
+    return detecciones_lesiones_deportivas
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
-@app.route('/detectar-objetos', methods=['POST'])
-def detectar_objetos():
+@app.route('/detectar-lesiones', methods=['POST'])
+def detectar_lesiones():
     data = request.get_json()
-    image_data = data['imagen'].split(',')[1]
-    image_bytes = base64.b64decode(image_data)
-    np_img = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
-
-    transform = transforms.ToTensor()
-    nn_input = transform(img)
-    detected_objects = model([nn_input])
-
-    draw_bboxes(img, detected_objects)
-
-    _, img_encoded = cv2.imencode('.jpg', img)
-    img_base64 = base64.b64encode(img_encoded).decode('utf-8')
-
-    return jsonify({'imagen': img_base64})
+    imagen_base64 = data['imagen']
+    
+    # Cargar el modelo
+    modelo = cargar_modelo()
+    
+    # Detectar lesiones deportivas
+    detecciones_lesiones = detectar_lesiones_deportivas(imagen_base64, modelo)
+    
+    return jsonify({'detecciones': detecciones_lesiones})
 
 if __name__ == '__main__':
     app.run(debug=True)
